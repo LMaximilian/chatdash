@@ -11,11 +11,13 @@ Controls:
     SPACE / UP / Left Mouse  = jump or UFO flap
     P                         = pause
     R                         = restart current level after a crash
+    M                         = mute / unmute sound
     ESC                       = quit
 """
 
 from __future__ import annotations
 
+from array import array
 import math
 import random
 import sys
@@ -95,6 +97,89 @@ def rect_touches_poly_rough(rect: pygame.Rect, poly: List[Tuple[float, float]], 
     # Fast, forgiving collision. This is intentionally not pixel-perfect.
     hit = polygon_rect(poly).inflate(-shrink, -shrink)
     return rect.colliderect(hit)
+
+
+# -------------------------------
+# Sound
+# -------------------------------
+class SoundManager:
+    """Small synthesized sound bank; no external audio assets required."""
+
+    def __init__(self) -> None:
+        self.enabled = pygame.mixer.get_init() is not None
+        self.muted = False
+        self.sounds: dict[str, pygame.mixer.Sound] = {}
+        if not self.enabled:
+            return
+
+        try:
+            self.sounds = {
+                "start": self.make_tone(440, 0.08, 0.35, end_frequency=760),
+                "jump": self.make_tone(520, 0.07, 0.25, end_frequency=680),
+                "flap": self.make_tone(760, 0.06, 0.22, end_frequency=480),
+                "portal": self.make_tone(330, 0.20, 0.35, end_frequency=1050, wave="triangle"),
+                "crash": self.make_noise(0.28, 0.42),
+                "complete": self.make_chord((523, 659, 784), 0.42, 0.34),
+                "win": self.make_chord((523, 659, 784, 1047), 0.75, 0.38),
+                "pause": self.make_tone(300, 0.08, 0.22, end_frequency=220),
+            }
+        except pygame.error:
+            self.enabled = False
+            self.sounds.clear()
+
+    @staticmethod
+    def envelope(i: int, total: int) -> float:
+        attack = max(1, int(total * 0.06))
+        release = max(1, int(total * 0.28))
+        return min(1.0, i / attack, (total - i) / release)
+
+    def make_tone(
+        self,
+        frequency: float,
+        duration: float,
+        volume: float,
+        end_frequency: Optional[float] = None,
+        wave: str = "square",
+    ) -> pygame.mixer.Sound:
+        sample_rate = pygame.mixer.get_init()[0]
+        total = int(sample_rate * duration)
+        phase = 0.0
+        samples = array("h")
+        for i in range(total):
+            mix = i / max(1, total - 1)
+            freq = lerp(frequency, end_frequency or frequency, mix)
+            phase += math.tau * freq / sample_rate
+            raw = (2 / math.pi) * math.asin(math.sin(phase)) if wave == "triangle" else (1.0 if math.sin(phase) >= 0 else -1.0)
+            samples.append(int(32767 * volume * self.envelope(i, total) * raw))
+        return pygame.mixer.Sound(buffer=samples)
+
+    def make_noise(self, duration: float, volume: float) -> pygame.mixer.Sound:
+        sample_rate = pygame.mixer.get_init()[0]
+        total = int(sample_rate * duration)
+        samples = array("h")
+        for i in range(total):
+            decay = (1 - i / total) ** 2
+            samples.append(int(32767 * volume * decay * random.uniform(-1, 1)))
+        return pygame.mixer.Sound(buffer=samples)
+
+    def make_chord(self, frequencies: Tuple[int, ...], duration: float, volume: float) -> pygame.mixer.Sound:
+        sample_rate = pygame.mixer.get_init()[0]
+        total = int(sample_rate * duration)
+        samples = array("h")
+        for i in range(total):
+            t = i / sample_rate
+            raw = sum(math.sin(math.tau * freq * t) for freq in frequencies) / len(frequencies)
+            samples.append(int(32767 * volume * self.envelope(i, total) * raw))
+        return pygame.mixer.Sound(buffer=samples)
+
+    def play(self, name: str) -> None:
+        if self.enabled and not self.muted and name in self.sounds:
+            self.sounds[name].play()
+
+    def toggle_mute(self) -> None:
+        self.muted = not self.muted
+        if self.muted and self.enabled:
+            pygame.mixer.stop()
 
 
 # -------------------------------
@@ -370,15 +455,18 @@ class Player:
             s = 42
         return pygame.Rect(int(self.pos.x - s / 2), int(self.pos.y - s / 2), s, s).inflate(-8, -8)
 
-    def action(self) -> None:
+    def action(self) -> bool:
         if self.mode == "cube":
             if self.on_ground:
                 self.vel.y = -790
                 self.on_ground = False
+                return True
         else:
             # UFO tap-flap. Strong but controlled.
             self.vel.y = -520
             self.on_ground = False
+            return True
+        return False
 
     def update(self, dt: float) -> None:
         self.invuln = max(0.0, self.invuln - dt)
@@ -590,6 +678,7 @@ class FloatingText:
 # -------------------------------
 class ChatDashGame:
     def __init__(self):
+        pygame.mixer.pre_init(44100, -16, 1, 512)
         pygame.init()
         pygame.display.set_caption("ChatDash - Cube, Spikes, Portals, UFO-ish Triangles")
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -598,6 +687,7 @@ class ChatDashGame:
         self.font_med = pygame.font.SysFont("arialblack", 30)
         self.font_small = pygame.font.SysFont("arial", 20, bold=True)
         self.font_tiny = pygame.font.SysFont("arial", 16, bold=True)
+        self.sound = SoundManager()
 
         self.levels = build_levels()
         sanity_check_levels(self.levels)
@@ -651,6 +741,7 @@ class ChatDashGame:
         self.level_index = 0
         self.best_level = 0
         self.reset_level()
+        self.sound.play("start")
 
     def emit_burst(self, pos: Vec2, color: Color, amount: int = 28, power: float = 260) -> None:
         for _ in range(amount):
@@ -665,6 +756,7 @@ class ChatDashGame:
         self.camera_shake = 18
         self.emit_burst(self.player.pos, RED, amount=44, power=430)
         self.floaters.append(FloatingText("BONK!  Press R or wait...", (WIDTH // 2, 150), RED))
+        self.sound.play("crash")
 
     def finish_level(self) -> None:
         self.state = LEVEL_COMPLETE
@@ -672,12 +764,14 @@ class ChatDashGame:
         self.camera_shake = 8
         self.best_level = max(self.best_level, self.level_index + 1)
         self.emit_burst(Vec2(WIDTH // 2, 180), self.level.theme_b, amount=75, power=360)
+        self.sound.play("complete")
 
     def next_level(self) -> None:
         self.level_index += 1
         if self.level_index >= len(self.levels):
             self.state = WIN
             self.emit_burst(Vec2(WIDTH // 2, HEIGHT // 2), YELLOW, amount=120, power=430)
+            self.sound.play("win")
         else:
             self.reset_level()
 
@@ -693,9 +787,14 @@ class ChatDashGame:
             if self.state == PLAYING and event.key == pygame.K_p:
                 self.prev_state = PLAYING
                 self.state = PAUSED
+                self.sound.play("pause")
                 return
             if self.state == PAUSED and event.key == pygame.K_p:
                 self.state = self.prev_state
+                self.sound.play("start")
+                return
+            if event.key == pygame.K_m:
+                self.sound.toggle_mute()
                 return
             if event.key == pygame.K_r and self.state in (CRASHED, PLAYING, PAUSED):
                 self.reset_level()
@@ -705,7 +804,8 @@ class ChatDashGame:
                 if self.state == MENU:
                     self.start_game()
                 elif self.state == PLAYING:
-                    self.player.action()
+                    if self.player.action():
+                        self.sound.play("jump" if self.player.mode == "cube" else "flap")
                 elif self.state == WIN:
                     self.state = MENU
                 elif self.state == LEVEL_COMPLETE and self.complete_timer < 1.25:
@@ -715,7 +815,8 @@ class ChatDashGame:
             if self.state == MENU:
                 self.start_game()
             elif self.state == PLAYING:
-                self.player.action()
+                if self.player.action():
+                    self.sound.play("jump" if self.player.mode == "cube" else "flap")
             elif self.state == WIN:
                 self.state = MENU
             elif self.state == LEVEL_COMPLETE and self.complete_timer < 1.25:
@@ -749,6 +850,7 @@ class ChatDashGame:
                 portal.used = True
                 portal.dead = True
                 self.player.set_mode(portal.target)
+                self.sound.play("portal")
                 self.player.invuln = 0.25
                 self.emit_burst(Vec2(portal.x, portal.y), PURPLE if portal.target == "ufo" else CYAN, amount=38, power=300)
                 label = "TRIANGLE UFO MODE" if portal.target == "ufo" else "CUBE MODE"
@@ -871,7 +973,7 @@ class ChatDashGame:
 
         press = self.font_med.render("PRESS START", True, WHITE)
         surf.blit(press, press.get_rect(center=(WIDTH // 2, 420)))
-        hint = self.font_small.render("SPACE / UP / CLICK   •   P pause   •   R restart", True, (190, 200, 230))
+        hint = self.font_small.render("SPACE / UP / CLICK   •   P pause   •   R restart   •   M mute", True, (190, 200, 230))
         surf.blit(hint, hint.get_rect(center=(WIDTH // 2, 456)))
 
         # Decorative cube and UFO with streamer previews.
